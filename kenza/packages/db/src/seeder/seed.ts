@@ -102,7 +102,7 @@ async function seed(): Promise<SeedResult> {
       await client.query(
         `INSERT INTO promotions (ref, modele, prix_normal_mad, prix_promo_mad, debut, fin, condition)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT DO NOTHING`,
+         ON CONFLICT (ref, debut, fin) DO NOTHING`,
         [
           promo.ref,
           promo.modele,
@@ -178,20 +178,22 @@ async function seed(): Promise<SeedResult> {
     const itemsData = readFileSync(dataFile('commandes-lignes.csv'), 'utf-8');
     const items = parse(itemsData, { columns: true, skip_empty_lines: true });
 
-    for (const item of items) {
-      await client.query(
-        `INSERT INTO order_items (commande_id, ref, modele, taille, quantite, prix_unitaire_mad)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT DO NOTHING`,
-        [
-          item.commande_id,
-          item.ref,
-          item.modele,
-          item.taille || null,
-          parseInt(item.quantite),
-          parseInt(item.prix_unitaire_mad),
-        ]
-      );
+    const existingItems = await client.query('SELECT COUNT(*) FROM order_items');
+    if (Number(existingItems.rows[0].count) === 0) {
+      for (const item of items) {
+        await client.query(
+          `INSERT INTO order_items (commande_id, ref, modele, taille, quantite, prix_unitaire_mad)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            item.commande_id,
+            item.ref,
+            item.modele,
+            item.taille || null,
+            parseInt(item.quantite),
+            parseInt(item.prix_unitaire_mad),
+          ]
+        );
+      }
     }
 
     const itemsCount = await client.query('SELECT COUNT(*) FROM order_items');

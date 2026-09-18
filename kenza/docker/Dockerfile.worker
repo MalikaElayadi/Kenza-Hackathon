@@ -5,8 +5,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
+COPY apps/worker ./apps/worker
 COPY packages ./packages
 
 WORKDIR /app
 
-CMD ["node", "--loader", "tsx", "packages/worker/src/index.ts"]
+CMD ["node", "--import", "tsx", "packages/worker/src/index.ts"]

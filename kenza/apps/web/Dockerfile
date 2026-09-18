@@ -5,6 +5,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
+COPY tsconfig.json ./tsconfig.json
 COPY apps/web ./apps/web
 COPY packages ./packages
 

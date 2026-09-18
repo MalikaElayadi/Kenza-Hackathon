@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS promotions (
 
 CREATE INDEX IF NOT EXISTS idx_promotions_ref ON promotions(ref);
 CREATE INDEX IF NOT EXISTS idx_promotions_dates ON promotions(debut, fin);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_promotions_ref_dates ON promotions(ref, debut, fin);
 
 -- Orders table
 CREATE TABLE IF NOT EXISTS orders (
