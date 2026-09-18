@@ -4,10 +4,10 @@
   "description": "Kenza API - Fastify backend",
   "type": "module",
   "scripts": {
-    "dev": "node --loader tsx src/main.ts",
-    "start": "node --loader tsx src/main.ts",
+    "dev": "node --import tsx src/main.ts",
+    "start": "node --import tsx src/main.ts",
     "build": "tsc",
-    "seed": "node --loader tsx ../db/src/seeder/seed.ts"
+    "seed": "node --import tsx ../../packages/db/src/seeder/seed.ts"
   },
   "dependencies": {
     "fastify": "^4.25.2",
