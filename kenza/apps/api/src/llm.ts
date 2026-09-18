@@ -40,9 +40,9 @@ export async function classifyWithGpt41(text: string): Promise<LlmIntent | null>
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const deployment = process.env.AZURE_OPENAI_DEPLOYMENT_NAME ?? 'gpt-4.1';
   const version = process.env.AZURE_OPENAI_API_VERSION ?? '2024-12-01-preview';
-  if (!configured(key) || !configured(endpoint)) return null;
-  const azureKey = key;
-  const azureEndpoint = endpoint;
+  if (!configured(key) || !configured(endpoint) || typeof key !== 'string' || typeof endpoint !== 'string') return null;
+  const azureKey: string = key;
+  const azureEndpoint: string = endpoint;
   const result = await request(`${azureEndpoint.replace(/\/$/, '')}/openai/deployments/${deployment}/chat/completions?api-version=${version}`, azureKey, {
     messages: [
       { role: 'system', content: 'Classifie le message commercial marocain. Réponds uniquement en JSON avec intention, langue et confiance. Ne donne aucun prix, stock ou délai.' },
