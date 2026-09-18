@@ -1,0 +1,23 @@
+{
+  "name": "@kenza/db",
+  "version": "1.0.0",
+  "description": "Database layer and queries",
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "seed": "node --loader tsx src/seeder/seed.ts"
+  },
+  "dependencies": {
+    "pg": "^8.11.3",
+    "csv-parse": "^5.5.2",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "@types/node": "^20.10.6",
+    "tsx": "^4.7.0"
+  }
+}

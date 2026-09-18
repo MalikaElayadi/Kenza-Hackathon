@@ -1,0 +1,18 @@
+{
+  "name": "@kenza/agent",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@langchain/langgraph": "^0.1.0",
+    "@langchain/core": "^0.1.0",
+    "@langchain/openai": "^0.0.1",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3"
+  }
+}
