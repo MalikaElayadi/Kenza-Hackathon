@@ -1,170 +1,72 @@
-import { StateGraph, END, START } from '@langchain/langgraph';
-import { KenzaState, Intention } from './types';
+import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
+import { Client } from 'pg';
+import { createClient } from 'redis';
+import { catalogueNode, conversationNode, escalationNode, guardrailNode, intentNode, multimodalNode } from './nodes';
+import { KenzaState, Language } from './types';
 
-/**
- * Kenza LangGraph - Main Orchestrator
- * 7 nodes, conditional routing, PostgreSQL checkpoint
- */
+const StateAnnotation = Annotation.Root({
+  conversationId: Annotation<string>,
+  clientId: Annotation<string | undefined>,
+  telephone: Annotation<string | undefined>,
+  langue: Annotation<Language>({ reducer: (_left, right) => right, default: () => 'fr' }),
+  messages: Annotation<KenzaState['messages']>({ reducer: (_left, right) => right, default: () => [] }),
+  intention: Annotation<KenzaState['intention']>,
+  facts: Annotation<KenzaState['facts']>({ reducer: (_left, right) => right, default: () => [] }),
+  cart: Annotation<KenzaState['cart']>({ reducer: (_left, right) => right, default: () => [] }),
+  ville: Annotation<string | undefined>,
+  shipping: Annotation<KenzaState['shipping']>,
+  remise: Annotation<KenzaState['remise']>,
+  draft: Annotation<string | undefined>,
+  guardrail: Annotation<KenzaState['guardrail']>,
+  escalation: Annotation<KenzaState['escalation']>,
+  orderId: Annotation<string | undefined>,
+  needsHuman: Annotation<boolean>({ reducer: (_left, right) => right, default: () => false }),
+});
 
 export class KenzaGraph {
-  private graph: StateGraph<any, any, any, any>;
+  private readonly graph: StateGraph<any>;
 
-  constructor() {
-    this.graph = new StateGraph({ channels: {} } as any);
-    this.setupNodes();
-    this.setupEdges();
+  constructor(private readonly pgClient: Client, private readonly redisClient: ReturnType<typeof createClient>) {
+    this.graph = new StateGraph(StateAnnotation);
+    this.graph
+      .addNode('multimodal', (state) => multimodalNode(state as unknown as KenzaState, this.pgClient, this.redisClient))
+      .addNode('intent', (state) => intentNode(state as unknown as KenzaState, this.pgClient, this.redisClient))
+      .addNode('catalogue', (state) => catalogueNode(state as unknown as KenzaState, this.pgClient, this.redisClient))
+      .addNode('conversation', (state) => conversationNode(state as unknown as KenzaState, this.pgClient, this.redisClient))
+      .addNode('guardrail', (state) => guardrailNode(state as unknown as KenzaState, this.pgClient, this.redisClient))
+      .addNode('escalation', (state) => escalationNode(state as unknown as KenzaState, this.pgClient, this.redisClient))
+      .addEdge(START, 'multimodal')
+      .addEdge('multimodal', 'intent')
+      .addConditionalEdges('intent', (state) => this.routeAfterIntent(state as unknown as KenzaState), {
+        catalogue: 'catalogue', conversation: 'conversation', escalate: 'escalation',
+      })
+      .addEdge('catalogue', 'conversation')
+      .addEdge('conversation', 'guardrail')
+      .addConditionalEdges('guardrail', (state) => this.routeAfterGuardrail(state as unknown as KenzaState), {
+        valid: END, retry: 'conversation', escalate: 'escalation',
+      })
+      .addEdge('escalation', END);
   }
 
-  private setupNodes() {
-    // Node 1: Multimodal (STT, Vision)
-    this.graph.addNode('multimodal', async (state: KenzaState) => {
-      // TODO: Handle audio/image inputs
-      // For now, pass through
-      return state;
-    });
-
-    // Node 2: Intent Classification
-    this.graph.addNode('intent', async (state: KenzaState) => {
-      // TODO: Call LLM to classify intention + language + difficulty
-      // Parse response using Zod
-      // Update state.intention, state.langue
-      return state;
-    });
-
-    // Node 3: Catalogue Search
-    this.graph.addNode('catalogue', async (state: KenzaState) => {
-      // TODO: Call tools (search_catalog, check_stock, get_price, etc.)
-      // Fill facts array with traced results
-      return state;
-    });
-
-    // Node 4: Conversation (Main Dialog)
-    this.graph.addNode('conversation', async (state: KenzaState) => {
-      // TODO: Call LLM for dialog
-      // Use facts (not hallucinate)
-      // Generate draft response
-      // Manage memory and cart
-      return state;
-    });
-
-    // Node 5: Guardrail (Validation)
-    this.graph.addNode('guardrail', async (state: KenzaState) => {
-      // TODO: Validate response
-      // Check no invented numbers
-      // Check remise <= 10%
-      // Check no reassort promises
-      // Return guardrail result
-      return state;
-    });
-
-    // Node 6: Escalation
-    this.graph.addNode('escalation', async (state: KenzaState) => {
-      // TODO: Create escalation record
-      // Send context to human
-      return state;
-    });
-
-    // Node 7: Relance (Abandoned Cart)
-    // Note: This runs async via BullMQ, not in sync loop
-  }
-
-  private setupEdges() {
-    // Entry point
-    // Flow: start -> multimodal -> intent
-    this.graph.addEdge(START, 'multimodal');
-    this.graph.addEdge('multimodal', 'intent');
-
-    // Flow: intent -> catalogue OR conversation (conditional)
-    this.graph.addConditionalEdges(
-      'intent',
-      this.routeAfterIntent,
-      {
-        catalogue: 'catalogue',
-        conversation: 'conversation',
-        escalate: 'escalation',
-      }
-    );
-
-    // Flow: catalogue -> conversation
-    this.graph.addEdge('catalogue', 'conversation');
-
-    // Flow: conversation -> guardrail
-    this.graph.addEdge('conversation', 'guardrail');
-
-    // Flow: guardrail -> END or retry (conditional)
-    this.graph.addConditionalEdges(
-      'guardrail',
-      this.routeAfterGuardrail,
-      {
-        valid: END,
-        retry: 'conversation',
-        escalate: 'escalation',
-      }
-    );
-
-    // Flow: escalation -> END
-    this.graph.addEdge('escalation', END);
-  }
-
-  private routeAfterIntent(state: KenzaState): string {
-    const intention = state.intention;
-
-    // Escalade intentions go directly
-    if (this.isEscalationIntention(intention)) {
-      return 'escalate';
-    }
-
-    // Catalogue-related intentions
-    if (this.isCatalogueIntention(intention)) {
-      return 'catalogue';
-    }
-
-    // Default to conversation
+  private routeAfterIntent(state: KenzaState): 'catalogue' | 'conversation' | 'escalate' {
+    if (state.needsHuman || ['hors_domaine', 'reclamation_arabe', 'rupture_arabe'].includes(state.intention ?? '')) return 'escalate';
+    if (['prix_et_disponibilite', 'rupture_de_stock', 'darija_prix', 'conseil_taille', 'livraison_arabe'].includes(state.intention ?? '')) return 'catalogue';
     return 'conversation';
   }
 
-  private routeAfterGuardrail(state: KenzaState): string {
-    const guardrail = state.guardrail;
-
-    if (!guardrail) {
-      return 'valid';
-    }
-
-    if (guardrail.ok) {
-      return 'valid';
-    }
-
-    // If violations and retries < 1
-    if (guardrail.retries < 1) {
-      guardrail.retries++;
-      return 'retry';
-    }
-
-    // Max retries exceeded
+  private routeAfterGuardrail(state: KenzaState): 'valid' | 'retry' | 'escalate' {
+    if (state.guardrail?.ok) return 'valid';
+    if ((state.guardrail?.retries ?? 0) < 1) return 'retry';
     return 'escalate';
   }
 
-  private isEscalationIntention(intention?: Intention): boolean {
-    const escalationIntentions = [
-      'hors_domaine',
-      'reclamation_arabe',
-      'rupture_arabe',
-    ];
-    return intention ? escalationIntentions.includes(intention) : false;
-  }
+  compile() { return this.graph.compile(); }
 
-  private isCatalogueIntention(intention?: Intention): boolean {
-    const catalogueIntentions = [
-      'prix_et_disponibilite',
-      'rupture_de_stock',
-      'conseil_taille',
-    ];
-    return intention ? catalogueIntentions.includes(intention) : false;
-  }
-
-  public compile() {
-    return this.graph.compile();
+  async invoke(state: KenzaState) {
+    const result = await this.compile().invoke(state as unknown as Record<string, unknown>);
+    return result as KenzaState;
   }
 }
 
+export { StateAnnotation };
 export default KenzaGraph;

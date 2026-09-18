@@ -83,8 +83,11 @@ export class Tools {
   async searchCatalog(params: z.infer<typeof SearchCatalogSchema>) {
     const validated = SearchCatalogSchema.parse(params);
     
-    let query = 'SELECT ref, modele, famille, couleur, taille, prix_mad, stock, promo_active FROM products WHERE 1=1';
-    const queryParams: any[] = [];
+    let query = `SELECT p.ref, p.modele, p.famille, p.couleur, p.taille, p.prix_mad, p.stock,
+      EXISTS (SELECT 1 FROM promotions pr WHERE pr.ref = p.ref AND pr.debut <= CURRENT_DATE AND pr.fin >= CURRENT_DATE) AS promo_active,
+      COALESCE((SELECT pr.prix_promo_mad FROM promotions pr WHERE pr.ref = p.ref AND pr.debut <= CURRENT_DATE AND pr.fin >= CURRENT_DATE LIMIT 1), p.prix_mad) AS prix_effectif_mad
+      FROM products p WHERE 1=1`;
+    const queryParams: unknown[] = [];
 
     if (validated.famille) {
       queryParams.push(validated.famille);
@@ -312,6 +315,18 @@ export class Tools {
       };
     }
 
+    if (validated.pct < 0) {
+      return {
+        autorise: false,
+        motif: 'Une remise négative est interdite',
+        demandee_pct: validated.pct,
+        accordee_pct: 0,
+        montant_original: validated.total,
+        montant_final: validated.total,
+        source: 'rule:business_logic',
+      };
+    }
+
     const montant_reduction = Math.round((validated.total * validated.pct) / 100);
     const montant_final = validated.total - montant_reduction;
 
@@ -332,16 +347,31 @@ export class Tools {
    */
   async updateCart(params: z.infer<typeof UpdateCartSchema>) {
     const validated = UpdateCartSchema.parse(params);
-
-    // TODO: Implémenter avec Redis
-    // Pour maintenant, juste retourner le succès
-
-    return {
-      action: validated.action,
-      conversationId: validated.conversationId,
-      success: true,
-      source: 'cart:session',
-    };
+    const currentResult = await this.pgClient.query('SELECT cart FROM conversations WHERE id = $1 FOR UPDATE', [validated.conversationId]);
+    const cart = (currentResult.rows[0]?.cart ?? []) as Array<{ ref: string; modele: string; taille: string; qte: number; prix_unitaire: number }>;
+    if (validated.action === 'clear') {
+      await this.pgClient.query('UPDATE conversations SET cart = $2, updated_at = NOW() WHERE id = $1', [validated.conversationId, JSON.stringify([])]);
+      return { action: validated.action, conversationId: validated.conversationId, cart: [], success: true, source: 'db:conversations.cart' };
+    }
+    if (!validated.ref) throw new Error('ref is required for cart changes');
+    const product = (await this.pgClient.query('SELECT ref, modele, taille, prix_mad, stock FROM products WHERE ref = $1 AND ($2::text IS NULL OR taille = $2)', [validated.ref, validated.taille ?? null])).rows[0];
+    if (!product) throw new Error(`Product variant not found: ${validated.ref}`);
+    const index = cart.findIndex((item) => item.ref === validated.ref);
+    if (validated.action === 'remove') {
+      if (index < 0) throw new Error(`Cart item not found: ${validated.ref}`);
+      cart.splice(index, 1);
+    } else if (validated.action === 'change_size') {
+      if (product.stock < (validated.qte ?? cart[index]?.qte ?? 1)) throw new Error('Stock insufficient for requested size');
+      if (index >= 0) cart[index] = { ...cart[index], taille: product.taille, prix_unitaire: product.prix_mad };
+      else cart.push({ ref: product.ref, modele: product.modele, taille: product.taille, qte: validated.qte ?? 1, prix_unitaire: product.prix_mad });
+    } else {
+      const qte = validated.qte ?? 1;
+      if (product.stock < qte) throw new Error('Stock insufficient');
+      if (index >= 0) cart[index].qte += qte;
+      else cart.push({ ref: product.ref, modele: product.modele, taille: product.taille, qte, prix_unitaire: product.prix_mad });
+    }
+    await this.pgClient.query('UPDATE conversations SET cart = $2, updated_at = NOW() WHERE id = $1', [validated.conversationId, JSON.stringify(cart)]);
+    return { action: validated.action, conversationId: validated.conversationId, cart, success: true, source: 'db:conversations.cart' };
   }
 
   /**
@@ -385,7 +415,11 @@ export class Tools {
         [validated.ville]
       );
 
-      const frais_livraison_mad = shippingResult.rows[0]?.frais_mad || 0;
+      if (shippingResult.rows.length === 0) {
+        throw new Error(`Unknown shipping city: ${validated.ville}`);
+      }
+
+      const frais_livraison_mad = shippingResult.rows[0].frais_mad;
       const total_mad = total_articles_mad + frais_livraison_mad;
 
       await this.pgClient.query(
