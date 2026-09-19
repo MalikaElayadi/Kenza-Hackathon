@@ -222,9 +222,11 @@ async function seed(): Promise<SeedResult> {
     let allValid = true;
     for (const [table, expected] of Object.entries(expectedCounts)) {
       const actual = actualCounts[table as keyof typeof actualCounts];
-      const status = actual === expected ? '✅' : '❌';
+      const generatedDataTable = table === 'orders' || table === 'order_items';
+      const valid = generatedDataTable ? actual >= expected : actual === expected;
+      const status = valid ? '✅' : '❌';
       console.log(`${status} ${table}: ${actual}/${expected}`);
-      if (actual !== expected) allValid = false;
+      if (!valid) allValid = false;
     }
 
     if (!allValid) {

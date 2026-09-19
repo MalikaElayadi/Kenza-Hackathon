@@ -23,8 +23,12 @@ function language(text: string): Language {
 function localized(lang: Language, fr: string, ar: string, darija: string) { return lang === 'ar' ? ar : lang === 'darija' ? darija : fr; }
 function cityOf(text: string) { return cities.find((city) => text.toLocaleLowerCase().includes(city.toLocaleLowerCase())); }
 function familyOf(text: string) {
-  return ['robe', 'caftan', 'chemise', 'pantalon', 'blouson', 'foulard', 'sac', 'chaussures', 'ceinture'].find((family) => new RegExp(`\\b${family}`, 'i').test(text));
+  return ['robe', 'caftan', 'chemise', 'pantalon', 'blouson', 'foulard', 'sac', 'chaussures', 'ceinture', 'veste'].find((family) => new RegExp(`\\b${family}`, 'i').test(text));
 }
+function colorOf(text: string) { return ['noir', 'blanc', 'bleu', 'bordeaux', 'camel', 'beige', 'terracotta', 'vert olive'].find((color) => text.toLocaleLowerCase().includes(color)); }
+function sizeOf(text: string) { return text.match(/(?:taille|size|pointure)\s*(S|M|L|XL|\d{2})\b/i)?.[1]?.toUpperCase(); }
+function quantityOf(text: string) { return Number(text.match(/\b(\d+)\s+(?:pi[eè]ces?|articles?|produits?|de)/i)?.[1] ?? 1); }
+function historyRequest(text: string) { return /(dernier|derni[eè]r|historique|anciens? achats?|achats?|commandes?)/i.test(text) || /(آخر|شريت|الحوايج)/u.test(text); }
 function escalationReason(text: string) {
   if (/(ice|facture.*soci[eé]t[eé]|soci[eé]t[eé])/i.test(text)) return 'facturation_societe';
   if (/(r[eé]clamation|litige|plainte)/i.test(text)) return 'reclamation';
@@ -43,7 +47,7 @@ async function handle(input: Input) {
   const requestedCity = cityOf(input.text);
   const mentionsDelivery = /(livraison|livrer|tawsil)/i.test(input.text);
   const reason = escalationReason(input.text) ?? (mentionsDelivery && !requestedCity && !input.ville ? 'ville_hors_grille' : undefined);
-  let intention = reason ? 'hors_domaine' : /commande|prends|prendre|nsajel/i.test(input.text) ? 'commande' : /taille|size|pointure/i.test(input.text) ? 'conseil_taille' : 'prix_et_disponibilite';
+  let intention = reason ? 'hors_domaine' : historyRequest(input.text) ? 'suivi_commande' : /commande|prends|prendre|nsajel/i.test(input.text) ? 'commande' : /taille|size|pointure/i.test(input.text) ? 'conseil_taille' : 'prix_et_disponibilite';
   if (!reason) {
     try {
       const classified = await classifyWithGpt41(input.text);
@@ -69,19 +73,31 @@ async function handle(input: Input) {
   if (reason) {
     await traced(traces, 'escalate', { motif: reason }, async () => (await pool.query(`INSERT INTO escalations (conversation_id, motif, contexte_resume, payload) VALUES ($1, $2, $3, $4) RETURNING id, statut`, [input.conversationId, reason, input.text, JSON.stringify({ clientId, lang })])).rows[0]);
     draft = localized(lang, 'Je transmets votre demande à notre équipe avec le contexte de cet échange.', 'سأحول طلبكم إلى فريقنا مع تفاصيل المحادثة.', 'Ghadi n7awwel talab dyalk l’équipe dyalna m3a tafasil dyal l-mohadata.');
+  } else if (intention === 'suivi_commande') {
+    const history = await traced(traces, 'get_client_history', { clientId, telephone: input.telephone }, async () => {
+      const client = clientId ? (await pool.query('SELECT client_id, nom FROM clients WHERE client_id = $1', [clientId])).rows[0] : null;
+      if (!client) return { client: null, orders: [] };
+      return { client, orders: (await pool.query(`SELECT o.commande_id, o.date, o.total_mad, o.statut, COALESCE(json_agg(json_build_object('modele', oi.modele, 'taille', oi.taille, 'quantite', oi.quantite)) FILTER (WHERE oi.id IS NOT NULL), '[]') AS items FROM orders o LEFT JOIN order_items oi ON oi.commande_id = o.commande_id WHERE o.client_id = $1 GROUP BY o.commande_id ORDER BY o.date DESC LIMIT 5`, [client.client_id])).rows };
+    });
+    if (!history.client) draft = localized(lang, 'J’ai besoin de votre téléphone ou identifiant client pour retrouver vos commandes.', 'أحتاج إلى رقم هاتفكم أو معرف العميل للعثور على طلباتكم.', 'Khasni numéro téléphone dyalk bach nl9a commandes dyalk.');
+    else draft = localized(lang, `Voici vos dernières commandes : ${history.orders.map((order: { commande_id: string; statut: string }) => `${order.commande_id} (${order.statut})`).join(', ')}.`, `هذه آخر طلباتكم: ${history.orders.map((order: { commande_id: string; statut: string }) => `${order.commande_id} (${order.statut})`).join('، ')}.`, `Hadi huma akher commandes dyalk: ${history.orders.map((order: { commande_id: string; statut: string }) => `${order.commande_id} (${order.statut})`).join(', ')}.`);
   } else {
-    const ref = input.text.match(/REF-\d{4}/i)?.[0].toUpperCase();
+    const ref = input.text.match(/REF-\d{4}/i)?.[0].toUpperCase() ?? cart[0]?.ref;
     const family = familyOf(input.text);
+    const color = colorOf(input.text);
+    const requestedSize = sizeOf(input.text);
     const product = await traced(traces, 'search_catalog', { ref, famille: family }, async () => {
       const result = ref
-        ? await pool.query('SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE ref = $1', [ref])
+        ? requestedSize
+          ? await pool.query('SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE modele = (SELECT modele FROM products WHERE ref = $1 LIMIT 1) AND taille = $2 LIMIT 1', [ref, requestedSize])
+          : await pool.query('SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE ref = $1', [ref])
         : family
-          ? await pool.query('SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE famille ILIKE $1 AND stock > 0 ORDER BY ref LIMIT 1', [`%${family}%`])
+          ? await pool.query('SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE famille ILIKE $1 AND ($2::text IS NULL OR couleur ILIKE $2) AND stock > 0 ORDER BY ref LIMIT 1', [`%${family}%`, color ? `%${color}%` : null])
           : { rows: [] };
       return result.rows[0] ?? null;
     });
     if (!product) {
-      draft = localized(lang, 'Indiquez la référence du produit, par exemple REF-0001, et je vérifie le catalogue réel.', 'يرجى إرسال مرجع المنتج حتى أتحقق من الكتالوج الحقيقي.', '3tini marja3 dyal produit b7al REF-0001 bach nchecki l-catalogue bssa7.');
+      draft = localized(lang, 'Je n’ai pas trouvé ce produit dans notre catalogue. Donnez-moi une autre caractéristique ou une couleur.', 'لم أجد هذا المنتج في الكتالوج. اذكروا خاصية أو لونا آخر.', 'Ma l9it had produit f-catalogue. 3tini couleur wela caractéristique okhra.');
     } else {
       const stock = await traced(traces, 'check_stock', { ref: product.ref, taille: product.taille }, async () => ({ disponible: product.stock > 0, stock: product.stock, ref: product.ref }));
       facts.push({ type: 'stock', value: stock.stock, source: 'db:products', ref: product.ref });
@@ -107,7 +123,7 @@ async function handle(input: Input) {
             } catch (error) { await pool.query('ROLLBACK'); throw error; }
           });
           facts.push({ type: 'total', value: order.total_mad, source: 'calc:order' }); draft = localized(lang, `Commande ${order.commande_id} créée. Total: ${order.total_mad} MAD.`, `تم إنشاء الطلب ${order.commande_id}. المجموع: ${order.total_mad} MAD.`, `Commande ${order.commande_id} tsjlat. Total: ${order.total_mad} MAD.`);
-        } else { if (shipping) facts.push({ type: 'shipping', value: shipping.frais_mad, source: 'db:shipping_rates' }); cart = [{ ref: product.ref, modele: product.modele, taille: product.taille, qte: 1, prix_unitaire: price.prix_effectif }]; draft = localized(lang, `Le produit est disponible à ${price.prix_effectif} MAD. Donnez votre ville pour vérifier la livraison.`, `المنتج متوفر بثمن ${price.prix_effectif} MAD. أرسلوا المدينة للتحقق من التوصيل.`, `Produit kayn b ${price.prix_effectif} MAD. 3tini l-mdina bach nchecki tawsil.`); }
+        } else { if (shipping) facts.push({ type: 'shipping', value: shipping.frais_mad, source: 'db:shipping_rates' }); cart = [{ ref: product.ref, modele: product.modele, taille: product.taille, qte: quantityOf(input.text), prix_unitaire: price.prix_effectif }]; draft = shipping ? localized(lang, `Le produit est disponible à ${price.prix_effectif} MAD. Livraison à ${city} : ${shipping.frais_mad} MAD.`, `المنتج متوفر بثمن ${price.prix_effectif} MAD. التوصيل إلى ${city}: ${shipping.frais_mad} درهم.`, `Produit kayn b ${price.prix_effectif} MAD. Tawsil l ${city}: ${shipping.frais_mad} MAD.`) : localized(lang, `Le produit est disponible à ${price.prix_effectif} MAD. Donnez votre ville pour vérifier la livraison.`, `المنتج متوفر بثمن ${price.prix_effectif} MAD. أرسلوا المدينة للتحقق من التوصيل.`, `Produit kayn b ${price.prix_effectif} MAD. 3tini l-mdina bach nchecki tawsil.`); }
       }
     }
   }

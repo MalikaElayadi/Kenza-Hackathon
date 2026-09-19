@@ -3,6 +3,7 @@ import { Client } from 'pg';
 
 // Schemas Zod pour validation stricte
 export const SearchCatalogSchema = z.object({
+  terme: z.string().optional(),
   famille: z.string().optional(),
   couleur: z.string().optional(),
   taille: z.string().optional(),
@@ -89,29 +90,34 @@ export class Tools {
       FROM products p WHERE 1=1`;
     const queryParams: unknown[] = [];
 
+    if (validated.terme) {
+      queryParams.push(`%${validated.terme}%`);
+      query += ` AND (p.modele ILIKE $${queryParams.length} OR p.famille ILIKE $${queryParams.length} OR p.couleur ILIKE $${queryParams.length} OR p.matiere ILIKE $${queryParams.length})`;
+    }
+
     if (validated.famille) {
       queryParams.push(validated.famille);
-      query += ` AND famille = $${queryParams.length}`;
+      query += ` AND p.famille ILIKE $${queryParams.length}`;
     }
     if (validated.couleur) {
       queryParams.push(validated.couleur);
-      query += ` AND couleur = $${queryParams.length}`;
+      query += ` AND p.couleur ILIKE $${queryParams.length}`;
     }
     if (validated.taille) {
       queryParams.push(validated.taille);
-      query += ` AND taille = $${queryParams.length}`;
+      query += ` AND p.taille = $${queryParams.length}`;
     }
     if (validated.genre) {
       queryParams.push(validated.genre);
-      query += ` AND genre = $${queryParams.length}`;
+      query += ` AND p.genre ILIKE $${queryParams.length}`;
     }
     if (validated.matiere) {
       queryParams.push(validated.matiere);
-      query += ` AND matiere = $${queryParams.length}`;
+      query += ` AND p.matiere ILIKE $${queryParams.length}`;
     }
     if (validated.prix_max) {
       queryParams.push(validated.prix_max);
-      query += ` AND prix_mad <= $${queryParams.length}`;
+      query += ` AND p.prix_mad <= $${queryParams.length}`;
     }
     if (validated.en_stock_seulement) {
       query += ' AND stock > 0';
