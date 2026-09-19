@@ -21,14 +21,49 @@ function language(text: string): Language {
   return 'fr';
 }
 function localized(lang: Language, fr: string, ar: string, darija: string) { return lang === 'ar' ? ar : lang === 'darija' ? darija : fr; }
-function cityOf(text: string) { return cities.find((city) => text.toLocaleLowerCase().includes(city.toLocaleLowerCase())); }
-function familyOf(text: string) {
-  return ['robe', 'caftan', 'chemise', 'pantalon', 'blouson', 'foulard', 'sac', 'chaussures', 'ceinture', 'veste'].find((family) => new RegExp(`\\b${family}`, 'i').test(text));
+function normalizeText(text: string) {
+  return text
+    .toLocaleLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9%\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
-function colorOf(text: string) { return ['noir', 'blanc', 'bleu', 'bordeaux', 'camel', 'beige', 'terracotta', 'vert olive'].find((color) => text.toLocaleLowerCase().includes(color)); }
+function cityOf(text: string) { return cities.find((city) => normalizeText(text).includes(normalizeText(city))); }
+function familyOf(text: string) {
+  const normalized = normalizeText(text);
+  const families = ['casque', 'casques', 'veste', 'vestes', 'blouson', 'blousons', 'caftan', 'caftans', 'chemise', 'chemises', 'pantalon', 'pantalons', 'robe', 'robes', 'foulard', 'foulards', 'sac', 'sacs', 'chaussures', 'ceinture', 'ceintures'];
+  return families.find((family) => normalized.includes(family));
+}
+function colorOf(text: string) {
+  const normalized = normalizeText(text);
+  const palette: Record<string, string> = {
+    noir: 'noir', noire: 'noir', black: 'noir',
+    blanc: 'blanc', blanche: 'blanc', white: 'blanc',
+    bleu: 'bleu', 'bleu nuit': 'bleu nuit', blue: 'bleu',
+    bordeaux: 'bordeaux', burgundy: 'bordeaux',
+    beige: 'beige', camel: 'camel', terracotta: 'terracotta',
+    'vert olive': 'vert olive', olive: 'vert olive', vert: 'vert',
+    gris: 'gris', 'gris perle': 'gris perle', grey: 'gris',
+  };
+  const match = Object.keys(palette).find((color) => normalized.includes(color));
+  return match ? palette[match] : undefined;
+}
 function sizeOf(text: string) { return text.match(/(?:taille|size|pointure)\s*(S|M|L|XL|\d{2})\b/i)?.[1]?.toUpperCase(); }
 function quantityOf(text: string) { return Number(text.match(/\b(\d+)\s+(?:pi[eè]ces?|articles?|produits?|de)/i)?.[1] ?? 1); }
-function historyRequest(text: string) { return /(dernier|derni[eè]r|historique|anciens? achats?|achats?|commandes?)/i.test(text) || /(آخر|شريت|الحوايج)/u.test(text); }
+function requestedQuantity(text: string, cart: Array<{ qte: number }>) { return /\b\d+\s+(?:pi[eè]ces?|articles?|produits?|de)/i.test(text) ? quantityOf(text) : cart[0]?.qte ?? 1; }
+function discountOf(text: string) { return Number(text.match(/(\d+)\s*%/)?.[1] ?? 0); }
+function historyRequest(text: string) { return /(dernier(?:s)? achats?|historique|anciens? achats?|mes commandes|suivi de commande|commandes pass[eé]es)/i.test(text) || /(آخر|شريت|الحوايج|الطلبات|الشراء|اشترى)/u.test(text); }
+function naturalCatalogTerm(text: string) {
+  const normalized = normalizeText(text);
+  const cleaned = normalized
+    .replace(/\b(avez|avez vous|vous|nous|aurez|cherche|cherchez|recherche|recherchez|veux|veut|je|tu|la|le|les|des|un|une|de|du|au|dans|avec|et|ou|sans|pour|combien|cout|coût|prix|stock|livraison|livrer|livrez|tous|toute|toutes|client|produit|article|piece|pieces|taille|pointure|couleur|ville|fes|fès)\b/g, ' ')
+    .replace(/\b(\d+|%|ref-\d+)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || undefined;
+}
 function escalationReason(text: string) {
   if (/(ice|facture.*soci[eé]t[eé]|soci[eé]t[eé])/i.test(text)) return 'facturation_societe';
   if (/(r[eé]clamation|litige|plainte)/i.test(text)) return 'reclamation';
@@ -86,18 +121,70 @@ async function handle(input: Input) {
     const family = familyOf(input.text);
     const color = colorOf(input.text);
     const requestedSize = sizeOf(input.text);
-    const product = await traced(traces, 'search_catalog', { ref, famille: family }, async () => {
-      const result = ref
-        ? requestedSize
-          ? await pool.query('SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE modele = (SELECT modele FROM products WHERE ref = $1 LIMIT 1) AND taille = $2 LIMIT 1', [ref, requestedSize])
-          : await pool.query('SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE ref = $1', [ref])
-        : family
-          ? await pool.query('SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE famille ILIKE $1 AND ($2::text IS NULL OR couleur ILIKE $2) AND stock > 0 ORDER BY ref LIMIT 1', [`%${family}%`, color ? `%${color}%` : null])
-          : { rows: [] };
-      return result.rows[0] ?? null;
+    const quantity = requestedQuantity(input.text, cart);
+    const changingExistingCart = Boolean(requestedSize && cart.length > 0 && cart[0].ref === ref);
+    const searchTerm = ref ? undefined : naturalCatalogTerm(input.text);
+    const city = input.ville ?? cityOf(input.text);
+    const shipping = city ? await traced(traces, 'get_shipping_cost', { ville: city }, async () => {
+      const row = (await pool.query('SELECT frais_mad, delai_heures, paiement_a_la_livraison FROM shipping_rates WHERE ville = $1', [city])).rows[0];
+      return row ? { trouve: true, ...row } : { trouve: false };
+    }) : null;
+
+    const product = await traced(traces, 'search_catalog', { ref, terme: searchTerm ?? '', famille: family, couleur: color, taille: requestedSize }, async () => {
+      if (ref) {
+        const byRef = await pool.query('SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE ref = $1', [ref]);
+        if (byRef.rows.length > 0) return byRef.rows[0];
+        if (requestedSize) {
+          const bySize = await pool.query('SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE modele = (SELECT modele FROM products WHERE ref = $1 LIMIT 1) AND taille = $2 LIMIT 1', [ref, requestedSize]);
+          if (bySize.rows.length > 0) return bySize.rows[0];
+        }
+        return null;
+      }
+
+      const terms = [family, color, searchTerm].filter(Boolean) as string[];
+      if (terms.length === 0 && !requestedSize) {
+        return null;
+      }
+
+      const clauses: string[] = [];
+      const params: unknown[] = [];
+      if (family) {
+        params.push(`%${family}%`);
+        clauses.push(`famille ILIKE $${params.length}`);
+      }
+      if (color) {
+        params.push(`%${color}%`);
+        clauses.push(`couleur ILIKE $${params.length}`);
+      }
+      if (searchTerm) {
+        params.push(`%${searchTerm}%`);
+        clauses.push(`(modele ILIKE $${params.length} OR famille ILIKE $${params.length} OR couleur ILIKE $${params.length} OR matiere ILIKE $${params.length})`);
+      }
+      if (requestedSize) {
+        params.push(requestedSize);
+        clauses.push(`taille = $${params.length}`);
+      }
+
+      const query = `SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE ${clauses.join(' AND ')} ORDER BY stock DESC, prix_mad ASC LIMIT 1`;
+      const rows = (await pool.query(query, params)).rows;
+      if (rows.length > 0) return rows[0];
+
+      if (terms.length > 0) {
+        const fallback = await pool.query(`SELECT ref, modele, taille, famille, couleur, prix_mad, stock FROM products WHERE (${family ? 'famille ILIKE $1 OR ' : ''}${color ? 'couleur ILIKE $2 OR ' : ''}modele ILIKE $3) AND stock >= 0 ORDER BY stock DESC, prix_mad ASC LIMIT 1`, [family ? `%${family}%` : undefined, color ? `%${color}%` : undefined, searchTerm ? `%${searchTerm}%` : '%']);
+        if (fallback.rows.length > 0) return fallback.rows[0];
+      }
+
+      return null;
     });
+
     if (!product) {
-      draft = localized(lang, 'Je n’ai pas trouvé ce produit dans notre catalogue. Donnez-moi une autre caractéristique ou une couleur.', 'لم أجد هذا المنتج في الكتالوج. اذكروا خاصية أو لونا آخر.', 'Ma l9it had produit f-catalogue. 3tini couleur wela caractéristique okhra.');
+      if (city && /(livraison|livrer|tawsil|livrez|livrez vous)/i.test(input.text)) {
+        draft = shipping && shipping.trouve
+          ? localized(lang, `Oui, nous livrons à ${city}. Les frais de livraison sont de ${shipping.frais_mad} MAD.`, `نعم، نقوم بالتوصيل إلى ${city}. تكلفة التوصيل ${shipping.frais_mad} درهم.`, `Ih, n7awwel l ${city}. Tawsil: ${shipping.frais_mad} MAD.`)
+          : localized(lang, `Nous ne livrons pas actuellement à ${city}.`, `لا نقوم بالتوصيل إلى ${city} حاليًا.`, `Ma n7awwelch l ${city} halla.`);
+      } else {
+        draft = localized(lang, 'Je n’ai pas trouvé ce produit dans notre catalogue. Donnez-moi une autre caractéristique ou une couleur.', 'لم أجد هذا المنتج في الكتالوج. اذكروا خاصية أو لونا آخر.', 'Ma l9it had produit f-catalogue. 3tini couleur wela caractéristique okhra.');
+      }
     } else {
       const stock = await traced(traces, 'check_stock', { ref: product.ref, taille: product.taille }, async () => ({ disponible: product.stock > 0, stock: product.stock, ref: product.ref }));
       facts.push({ type: 'stock', value: stock.stock, source: 'db:products', ref: product.ref });
@@ -107,23 +194,27 @@ async function handle(input: Input) {
       } else {
         const price = await traced(traces, 'get_price', { ref: product.ref }, async () => (await pool.query(`SELECT p.prix_mad AS prix_normal, COALESCE((SELECT prix_promo_mad FROM promotions pr WHERE pr.ref = p.ref AND pr.debut <= CURRENT_DATE AND pr.fin >= CURRENT_DATE LIMIT 1), p.prix_mad) AS prix_effectif FROM products p WHERE p.ref = $1`, [product.ref])).rows[0]);
         facts.push({ type: 'price', value: price.prix_effectif, source: 'db:products+promotions', ref: product.ref });
-        const city = input.ville ?? cityOf(input.text);
-        const shipping = city ? await traced(traces, 'get_shipping_cost', { ville: city }, async () => { const row = (await pool.query('SELECT frais_mad, delai_heures, paiement_a_la_livraison FROM shipping_rates WHERE ville = $1', [city])).rows[0]; return row ? { trouve: true, ...row } : { trouve: false }; }) : null;
         if (shipping && !shipping.trouve) draft = localized(lang, 'Cette ville ne figure pas dans notre grille. Je transmets la demande à un conseiller.', 'هذه المدينة غير موجودة في شبكة التوصيل. سأحول الطلب إلى مستشار.', 'Had l-mdina makaynach f-grille dyal tawsil. Ghadi n7awwel talab l-mostaشار.');
         else if (shipping && intention === 'commande' && clientId) {
           facts.push({ type: 'shipping', value: shipping.frais_mad, source: 'db:shipping_rates' });
+          const requestedDiscount = discountOf(input.text);
+          const discount = requestedDiscount > 0 ? await traced(traces, 'apply_discount', { total: price.prix_effectif * quantity, pct: requestedDiscount }, async () => {
+            if (requestedDiscount > 10) return { autorise: false, accordee_pct: 0, montant_final: price.prix_effectif * quantity };
+            const reduction = Math.round((price.prix_effectif * quantity * requestedDiscount) / 100);
+            return { autorise: true, accordee_pct: requestedDiscount, montant_reduction: reduction, montant_final: price.prix_effectif * quantity - reduction };
+          }) : { autorise: true, accordee_pct: 0, montant_final: price.prix_effectif * quantity };
           const order = await traced(traces, 'create_order', { ref: product.ref, ville: city }, async () => {
             await pool.query('BEGIN');
             try {
               const locked = (await pool.query('SELECT stock FROM products WHERE ref = $1 FOR UPDATE', [product.ref])).rows[0];
-              if (!locked || locked.stock < 1) throw new Error('Stock insufficient');
-              await pool.query('UPDATE products SET stock = stock - 1 WHERE ref = $1', [product.ref]); const id = `CMD-${Date.now()}`; const total = price.prix_effectif + shipping.frais_mad;
-              await pool.query(`INSERT INTO orders (commande_id, client_id, date, canal, statut, total_articles_mad, frais_livraison_mad, total_mad, ville_livraison, paiement, created_by) VALUES ($1, $2, CURRENT_DATE, 'web', 'en préparation', $3, $4, $5, $6, $7, 'agent')`, [id, clientId, price.prix_effectif, shipping.frais_mad, total, city, shipping.paiement_a_la_livraison ? 'à la livraison' : 'virement']);
-              await pool.query('INSERT INTO order_items (commande_id, ref, modele, taille, quantite, prix_unitaire_mad) VALUES ($1, $2, $3, $4, 1, $5)', [id, product.ref, product.modele, product.taille, price.prix_effectif]); await pool.query('COMMIT'); return { commande_id: id, total_mad: total };
+              if (!locked || locked.stock < quantity) throw new Error('Stock insufficient');
+              await pool.query('UPDATE products SET stock = stock - $1 WHERE ref = $2', [quantity, product.ref]); const id = `CMD-${Date.now()}`; const total = discount.montant_final + shipping.frais_mad;
+              await pool.query(`INSERT INTO orders (commande_id, client_id, date, canal, statut, total_articles_mad, frais_livraison_mad, total_mad, ville_livraison, paiement, created_by) VALUES ($1, $2, CURRENT_DATE, 'web', 'en préparation', $3, $4, $5, $6, $7, 'agent')`, [id, clientId, discount.montant_final, shipping.frais_mad, total, city, shipping.paiement_a_la_livraison ? 'à la livraison' : 'virement']);
+              await pool.query('INSERT INTO order_items (commande_id, ref, modele, taille, quantite, prix_unitaire_mad) VALUES ($1, $2, $3, $4, $5, $6)', [id, product.ref, product.modele, product.taille, quantity, price.prix_effectif]); await pool.query('COMMIT'); return { commande_id: id, total_mad: total };
             } catch (error) { await pool.query('ROLLBACK'); throw error; }
           });
-          facts.push({ type: 'total', value: order.total_mad, source: 'calc:order' }); draft = localized(lang, `Commande ${order.commande_id} créée. Total: ${order.total_mad} MAD.`, `تم إنشاء الطلب ${order.commande_id}. المجموع: ${order.total_mad} MAD.`, `Commande ${order.commande_id} tsjlat. Total: ${order.total_mad} MAD.`);
-        } else { if (shipping) facts.push({ type: 'shipping', value: shipping.frais_mad, source: 'db:shipping_rates' }); cart = [{ ref: product.ref, modele: product.modele, taille: product.taille, qte: quantityOf(input.text), prix_unitaire: price.prix_effectif }]; draft = shipping ? localized(lang, `Le produit est disponible à ${price.prix_effectif} MAD. Livraison à ${city} : ${shipping.frais_mad} MAD.`, `المنتج متوفر بثمن ${price.prix_effectif} MAD. التوصيل إلى ${city}: ${shipping.frais_mad} درهم.`, `Produit kayn b ${price.prix_effectif} MAD. Tawsil l ${city}: ${shipping.frais_mad} MAD.`) : localized(lang, `Le produit est disponible à ${price.prix_effectif} MAD. Donnez votre ville pour vérifier la livraison.`, `المنتج متوفر بثمن ${price.prix_effectif} MAD. أرسلوا المدينة للتحقق من التوصيل.`, `Produit kayn b ${price.prix_effectif} MAD. 3tini l-mdina bach nchecki tawsil.`); }
+          facts.push({ type: 'total', value: order.total_mad, source: 'calc:order' }); cart = []; draft = localized(lang, `Commande ${order.commande_id} créée pour ${quantity} article(s). Total: ${order.total_mad} MAD.`, `تم إنشاء الطلب ${order.commande_id} لعدد ${quantity}. المجموع: ${order.total_mad} MAD.`, `Commande ${order.commande_id} tsjlat b ${quantity}. Total: ${order.total_mad} MAD.`);
+        } else { if (shipping) facts.push({ type: 'shipping', value: shipping.frais_mad, source: 'db:shipping_rates' }); const requestedVariantAvailable = changingExistingCart && product.taille === requestedSize; cart = requestedVariantAvailable ? [{ ...cart[0], ref: product.ref, modele: product.modele, taille: product.taille, prix_unitaire: price.prix_effectif }] : cart.length && changingExistingCart ? cart : [{ ref: product.ref, modele: product.modele, taille: product.taille, qte: quantity, prix_unitaire: price.prix_effectif }]; draft = changingExistingCart && !requestedVariantAvailable ? localized(lang, `La taille ${requestedSize} n’est pas disponible pour ce produit.`, `المقاس ${requestedSize} غير متوفر لهذا المنتج.`, `Taille ${requestedSize} makaynach l-had produit.`) : requestedVariantAvailable ? localized(lang, `C’est noté, votre panier est maintenant en taille ${product.taille}.`, `تم تحديث السلة إلى المقاس ${product.taille}.`, `Safi, panier تبدل l-taille ${product.taille}.`) : shipping ? localized(lang, `Le produit est disponible à ${price.prix_effectif} MAD. Livraison à ${city} : ${shipping.frais_mad} MAD.`, `المنتج متوفر بثمن ${price.prix_effectif} MAD. التوصيل إلى ${city}: ${shipping.frais_mad} درهم.`, `Produit kayn b ${price.prix_effectif} MAD. Tawsil l ${city}: ${shipping.frais_mad} MAD.`) : localized(lang, `Le produit est disponible à ${price.prix_effectif} MAD. Donnez votre ville pour vérifier la livraison.`, `المنتج متوفر بثمن ${price.prix_effectif} MAD. أرسلوا المدينة للتحقق من التوصيل.`, `Produit kayn b ${price.prix_effectif} MAD. 3tini l-mdina bach nchecki tawsil.`); }
       }
     }
   }
